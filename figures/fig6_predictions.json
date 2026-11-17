@@ -1,0 +1,9 @@
+{
+  "source": "plan.md:1963 (E42 P70 readout of registered predictions)",
+  "predicted_deep_share": {
+    "lingshu7b|slake_en": 0.092,
+    "lingshu7b|rin_anat_mc": 0.041,
+    "qwen3vl8b|slake_en": 0.039,
+    "qwen3vl8b|rin_anat_mc": 0.0091
+  }
+}

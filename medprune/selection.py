@@ -1,0 +1,362 @@
+"""Which visual tokens to keep — the method registry and pure NumPy selectors (plan.md §C3, §D3).
+
+Every selector returns sorted, unique indices into the visual-token list (raster order) of length exactly k.
+When a restriction (`allowed`) leaves fewer than k candidates, the selector keeps all of them and fills the rest
+from outside the restriction (best score, or evenly spaced for score-free rules), so budgets are always equal.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class MethodSpec:
+    """How a method chooses tokens and where it acts inside the LLM.
+
+    score_layer: decoder layer whose attention is read (K-1 for FastV); None if no scores are needed.
+    mask_from:   first decoder layer at which dropped visual keys are masked; 0 = before the LLM.
+    """
+
+    name: str
+    rule: str  # "none" | "random" | "random_sched" | "uniform" | "topk" | "static" | "inverse" | "divprune" | "pdrop" |
+    #            "sparsevlm" | "vispruner" | "prunesid" | "btp" | "visionzip" | "hiprune" | "cdpruner" | "feather" |
+    #            "vscan" | "transprune" (medprune/baselines/) | "stratified" | "pool" | "kmeans" | "slic" (medprune/remedy.py)
+    score: str | None = None  # None | "attn" (last prompt token) | "ropefree" | "text" (every token after the
+    #                           image) | "raters" (SparseVLM text raters)
+    score_layer: int | None = None
+    mask_from: int | None = None
+    gate: str | None = None  # None | "foreground" | "oracle"
+    tau: float = 0.5
+    bg_quota: float = 0.0
+    two_pass: bool = False
+    image: bool = True
+    exclude_outliers: bool = False
+    physical_gate: bool = False
+    invert: bool = False  # keep the lowest scores instead (attention-informativeness control)
+    profile: bool = False  # no pruning; log both readouts and sink scores at every layer (plan.md §A10 D1)
+    merge: str | None = None  # None = the method's own; "off" = drop without merging; "nearest" = merge every dropped
+    #                           token into its most similar kept token before the LLM (VScan's token_merging; E18);
+    #                           "foreground" = only dropped foreground tokens merge, background is discarded;
+    #                           "bgsum" = as "foreground", plus one kept background token holding the background mean
+    match_fastv: bool = False  # keep FastV's mean visual tokens per layer from layer 0 (VScan's budget; E41)
+    prop_attn: bool = False  # E42a: + log s on each kept token's attention logit, s = the vision tokens its merge row
+    #                          averages (ToMe's proportional attention); needs a merge
+    sched_at: float | None = None  # E42b: second stage of the token-matched read-then-prune schedule at
+    #                                round(sched_at * L) (`vscan_schedule`); stage 2 = one survivor per Hilbert stratum
+    sched_flat: bool = False  # E47: the schedule's counts match the flat keep count k of this budget (mean visual tokens
+    #                           per layer <= k, `remedy.flat_sched_counts`) instead of FastV's mean (`vscan_schedule`)
+    sink: bool = False  # E47 BG-S: visual token 0 (the image's first token, Full's main background attention sink) kept
+    #                     unmerged (s = 1) in place of one foreground stratum
+    bg_null: bool = False  # E47 BG-N: with merge "bgsum", the summary token's value vector is zeroed in every layer, so
+    #                        it carries the background's attention mass (+ log s with prop_attn) but no content
+    route: tuple[str, str] | None = None  # ScanPrune: (branch for one-token answers, branch for generated answers);
+    #                                       the instruction picks the branch per question (`adoption.prompt_style`)
+
+
+def _spec(name: str, rule: str, **kw) -> tuple[str, MethodSpec]:
+    return name, MethodSpec(name=name, rule=rule, **kw)
+
+
+METHODS: dict[str, MethodSpec] = dict(
+    [
+        _spec("full", "none"),
+        _spec("text_only", "none", image=False),
+        _spec("random_l2", "random", mask_from=2),
+        _spec("random_l0", "random", mask_from=0),
+        _spec("uniform_l2", "uniform", mask_from=2),
+        _spec("fastv", "topk", score="attn", score_layer=1, mask_from=2),
+        _spec("fastv_prellm", "topk", score="attn", score_layer=1, mask_from=0, two_pass=True),
+        _spec("ropefree", "topk", score="ropefree", score_layer=1, mask_from=2),
+        _spec("gate_fastv", "topk", score="attn", score_layer=1, mask_from=2, gate="foreground"),
+        _spec("gate_ropefree", "topk", score="ropefree", score_layer=1, mask_from=2, gate="foreground"),
+        _spec("gate_uniform", "uniform", mask_from=2, gate="foreground"),
+        _spec("gate_random", "random", mask_from=2, gate="foreground"),
+        _spec("fastv_k8", "topk", score="attn", score_layer=7, mask_from=8),
+        _spec("fastv_k16", "topk", score="attn", score_layer=15, mask_from=16),
+        # Early-layer sweep (plan.md E17, Nov 7): FastV scored at layers 2-5; the E12 profile predicts which help.
+        _spec("fastv_k3", "topk", score="attn", score_layer=2, mask_from=3),
+        _spec("fastv_k4", "topk", score="attn", score_layer=3, mask_from=4),
+        _spec("fastv_k5", "topk", score="attn", score_layer=4, mask_from=5),
+        _spec("fastv_k6", "topk", score="attn", score_layer=5, mask_from=6),
+        # Depth x ranking (plan.md E19, Nov 7): where between K = 8 and 16 the FastV ranking stops costing accuracy, and
+        # Random's keep-set (same seed -> same tokens as `random_l2`) applied from layer 8 / 16: depth alone.
+        _spec("fastv_k10", "topk", score="attn", score_layer=9, mask_from=10),
+        _spec("fastv_k12", "topk", score="attn", score_layer=11, mask_from=12),
+        _spec("fastv_k14", "topk", score="attn", score_layer=13, mask_from=14),
+        _spec("fastv_k20", "topk", score="attn", score_layer=19, mask_from=20),  # E19b: Qwen3-VL (36 layers) only
+        _spec("fastv_k24", "topk", score="attn", score_layer=23, mask_from=24),
+        _spec("random_l8", "random", mask_from=8),
+        _spec("random_l16", "random", mask_from=16),
+        _spec("random_l12", "random", mask_from=12),  # E36: the same tokens cut inside the reading window
+        _spec("random_l20", "random", mask_from=20),
+        # Background context for a coverage selector (plan.md E20, Nov 7): on Qwen3-VL's open questions that ask for the
+        # body region the gate costs Uniform 12.6 points (answers drift to an organ inside the right region). Give back
+        # 3% of N evenly spaced background tokens, or admit boundary cells (tau 0.25).
+        # VScan's token-matched two-stage schedule with Random's tokens (plan.md E30, Nov 7): f1·N random tokens kept
+        # from layer 0, a random f2·N of them from layer L/2 (no merge). Separates VScan's schedule from its selection.
+        _spec("random_vscan", "random_sched", mask_from=0),
+        # The same token-matched schedule with the hard cut at layer 20, after Lingshu's findings window (E36, E38).
+        _spec("random_sched20", "random_sched", mask_from=0, score_layer=20),
+        _spec("random_sched24", "random_sched", mask_from=0, score_layer=24),  # E39: Qwen3-VL (36 layers)
+        _spec("random_sched26", "random_sched", mask_from=0, score_layer=26),
+        _spec("gate_uniform_q3", "uniform", mask_from=2, gate="foreground", bg_quota=0.03),
+        _spec("gate_uniform_t25", "uniform", mask_from=2, gate="foreground", tau=0.25),
+        _spec("static_map", "static", mask_from=2),
+        _spec("inverse_gate", "inverse", mask_from=2, gate="foreground"),
+        _spec("oracle_gate", "topk", score="attn", score_layer=1, mask_from=2, gate="oracle"),
+        _spec("artifact_excl", "topk", score="attn", score_layer=1, mask_from=2, exclude_outliers=True),
+        _spec("gate_quota3", "topk", score="attn", score_layer=1, mask_from=2, gate="foreground", bg_quota=0.03),
+        _spec("gate_tau25", "topk", score="attn", score_layer=1, mask_from=2, gate="foreground", tau=0.25),
+        _spec("gate_tau75", "topk", score="attn", score_layer=1, mask_from=2, gate="foreground", tau=0.75),
+        _spec("divprune", "divprune", mask_from=0),
+        _spec("gate_divprune", "divprune", mask_from=0, gate="foreground"),
+        _spec("pdrop", "pdrop", score="attn", score_layer=1, mask_from=2),
+        _spec("gate_pdrop", "pdrop", score="attn", score_layer=1, mask_from=2, gate="foreground"),
+        _spec("gate_input_fastv", "topk", score="attn", score_layer=1, mask_from=2, gate="foreground",
+              physical_gate=True),
+        _spec("fastv_bottom", "topk", score="attn", score_layer=1, mask_from=2, invert=True),
+        _spec("fastv_text", "topk", score="text", score_layer=1, mask_from=2),
+        _spec("full_profile", "none", profile=True),
+        # Published pruners, official selection code (medprune/baselines/, plan.md E13). Stage layers and budgets
+        # come from the method's schedule at run time; mask_from here is the first layer any token is masked.
+        _spec("sparsevlm", "sparsevlm", score="raters", score_layer=2, mask_from=3),
+        _spec("vispruner", "vispruner", mask_from=0),
+        _spec("prunesid", "prunesid", mask_from=0),
+        _spec("btp", "btp", score="attn", mask_from=3),
+        # SparseVLM ablation (plan.md E16, D-15): its text raters with one FastV-style stage at 10%, at FastV's layer
+        # (raters vs last token at the same schedule) and at SparseVLM's first-stage layer (vs the 3-stage schedule).
+        _spec("fastv_raters", "topk", score="raters", score_layer=1, mask_from=2),
+        _spec("sparsevlm_single", "topk", score="raters", score_layer=2, mask_from=3),
+        # Published pruners added Nov 7 (plan.md E14, G19): vision-encoder attention (VisionZip, HiPrune),
+        # instruction-conditioned diversity without LLM attention (CDPruner), RoPE-free + uniform early stage (FEATHER),
+        # encoder scans + mid-layer pruning (VScan), token transition + instruction attention (TransPrune).
+        _spec("visionzip", "visionzip", mask_from=0),
+        _spec("gate_visionzip", "visionzip", mask_from=0, gate="foreground"),
+        _spec("hiprune", "hiprune", mask_from=0),
+        _spec("cdpruner", "cdpruner", mask_from=0),
+        _spec("gate_cdpruner", "cdpruner", mask_from=0, gate="foreground"),
+        _spec("cdpruner_neg", "cdpruner", mask_from=0, invert=True),  # the released LLaVA code's relevance sign
+        _spec("gate_cdpruner_neg", "cdpruner", mask_from=0, gate="foreground", invert=True),  # E17b
+        # E49 (Nov 14): the anatomy gate in front of every published pruner of the main table, one rule for all
+        # (medprune/baselines/__init__.py): candidates = the gate's foreground, the method's own ranking tops up.
+        _spec("gate_sparsevlm", "sparsevlm", score="raters", score_layer=2, mask_from=3, gate="foreground"),
+        _spec("gate_btp", "btp", score="attn", mask_from=3, gate="foreground"),
+        _spec("gate_vispruner", "vispruner", mask_from=0, gate="foreground"),
+        _spec("gate_prunesid", "prunesid", mask_from=0, gate="foreground"),
+        _spec("gate_hiprune", "hiprune", mask_from=0, gate="foreground"),
+        _spec("gate_feather", "feather", score="ropefree", mask_from=8, gate="foreground"),
+        _spec("gate_vscan", "vscan", mask_from=0, gate="foreground"),
+        _spec("gate_transprune", "transprune", score="text", mask_from=7, gate="foreground"),
+        _spec("gate_pool", "pool", mask_from=0, gate="foreground"),
+        _spec("feather", "feather", score="ropefree", mask_from=8),
+        _spec("vscan", "vscan", mask_from=0),
+        _spec("transprune", "transprune", score="text", mask_from=7),
+        # Merge ablation (plan.md E18, Nov 7): does merging, not selection, rescue VisionZip and VScan?
+        _spec("visionzip_nomerge", "visionzip", mask_from=0, merge="off"),
+        _spec("vscan_nomerge", "vscan", mask_from=0, merge="off"),
+        _spec("fastv_merge", "topk", score="attn", score_layer=1, mask_from=0, two_pass=True, merge="nearest"),
+        # Merge as the remedy (plan.md E21, Nov 7): VScan's merge lifts FastV's own keep-set by 35-39 points on RIN
+        # anatomy. Does it lift Random (a keep-set that already covers the foreground), and does the gate add anything
+        # once the dropped tokens are merged?
+        _spec("random_merge", "random", mask_from=0, merge="nearest"),
+        _spec("gate_fastv_merge", "topk", score="attn", score_layer=1, mask_from=0, two_pass=True, gate="foreground",
+              merge="nearest"),
+        # The remedy (plan.md E40, Nov 9): one random token per Hilbert stratum (coverage without a fixed grid's
+        # aliasing) + merge, then the gate (dropped background discarded), then one background summary token in place
+        # of a foreground token; average pooling to the same k is the reviewer's baseline (VTC-Bench). Pre-LLM, 10%
+        # kept, as VisionZip / PruneSID / CDPruner / Random + merge. E41: the gated rows at FastV's mean visual tokens
+        # per layer (VScan's budget: 16.4% of N on Lingshu, 15.0% on Qwen3-VL at 10%).
+        _spec("jitter_merge", "stratified", mask_from=0, merge="nearest"),
+        _spec("gate_jitter_merge", "stratified", mask_from=0, gate="foreground", merge="foreground"),
+        _spec("gate_jitter_bgsum", "stratified", mask_from=0, gate="foreground", merge="bgsum"),
+        _spec("pool", "pool", mask_from=0),
+        _spec("gate_jitter_merge_eq", "stratified", mask_from=0, gate="foreground", merge="foreground",
+              match_fastv=True),
+        _spec("gate_jitter_bgsum_eq", "stratified", mask_from=0, gate="foreground", merge="bgsum", match_fastv=True),
+        # E42 (registered Nov 9 18:01, plan.md): the recipe at the equal budget + the size term (E42a; same keep-set
+        # and merge as `gate_jitter_merge_eq`), on the token-matched read-then-prune schedule cut at 5/7 depth (E42b;
+        # Lingshu 20, Qwen3-VL 26: E38 / E39's cut), and both (E42c, run only if E42a and E42b are both adopted).
+        _spec("gate_jitter_merge_pa_eq", "stratified", mask_from=0, gate="foreground", merge="foreground",
+              match_fastv=True, prop_attn=True),
+        _spec("gate_jitter_merge_sched", "stratified", mask_from=0, gate="foreground", merge="foreground",
+              sched_at=5 / 7),
+        _spec("gate_jitter_merge_sched_pa", "stratified", mask_from=0, gate="foreground", merge="foreground",
+              sched_at=5 / 7, prop_attn=True),
+        # E43 (plan.md): the size term at 10% kept (2B), and merge clusters chosen by k-means++ + Lloyd inside the gate,
+        # kept at their medoids, with the size term at the equal budget (2A).
+        _spec("gate_jitter_merge_pa", "stratified", mask_from=0, gate="foreground", merge="foreground", prop_attn=True),
+        _spec("gate_kmeans_merge_pa_eq", "kmeans", mask_from=0, gate="foreground", merge="foreground", match_fastv=True,
+              prop_attn=True),
+        # E46 (plan.md): the two dropped pieces repaired - the background summary token with the size term (its row
+        # carries log of the dropped background), and SLIC merge clusters (content + position) with the size term.
+        _spec("gate_jitter_bgsum_pa_eq", "stratified", mask_from=0, gate="foreground", merge="bgsum", match_fastv=True,
+              prop_attn=True),
+        _spec("gate_slic_merge_pa_eq", "slic", mask_from=0, gate="foreground", merge="foreground", match_fastv=True,
+              prop_attn=True),
+        # E47 (plan.md): the 10%-kept recipe (2B) pushed toward Full at the same tokens per layer. The read-then-prune
+        # schedule token-matched to the flat 10% count (the route's single-token branch at 10%), SLIC clusters flat and
+        # scheduled, and two background mechanisms: the sink token kept, or the background's mass without content.
+        _spec("gate_jitter_merge_sched10_pa", "stratified", mask_from=0, gate="foreground", merge="foreground",
+              sched_at=5 / 7, sched_flat=True, prop_attn=True),
+        _spec("gate_slic_merge_pa", "slic", mask_from=0, gate="foreground", merge="foreground", prop_attn=True),
+        _spec("gate_slic_merge_sched10_pa", "slic", mask_from=0, gate="foreground", merge="foreground", sched_at=5 / 7,
+              sched_flat=True, prop_attn=True),
+        _spec("gate_jitter_sink_merge_pa", "stratified", mask_from=0, gate="foreground", merge="foreground", sink=True,
+              prop_attn=True),
+        _spec("gate_jitter_bgnull_pa", "stratified", mask_from=0, gate="foreground", merge="bgsum", bg_null=True,
+              prop_attn=True),
+        # ScanPrune, the final method (plan.md E43 / E47): foreground gate -> Hilbert-stratified coverage -> foreground
+        # merge -> size term (+ log s), routed by the answer format. One-token answers (mc, judgement) take the
+        # read-then-prune schedule cut at 5/7 depth; generated answers keep the flat count. Two operating points:
+        # `scanprune` at 10% kept (schedule matched to the flat 10% count) and `scanprune_eq` at FastV's mean visual
+        # tokens per layer (VScan's budget). Each question gets exactly its branch's keep-set, merge and stages.
+        _spec("scanprune", "route", mask_from=0, gate="foreground", merge="foreground", prop_attn=True,
+              route=("gate_jitter_merge_sched10_pa", "gate_jitter_merge_pa")),
+        _spec("scanprune_eq", "route", mask_from=0, gate="foreground", merge="foreground", prop_attn=True,
+              route=("gate_jitter_merge_sched_pa", "gate_jitter_merge_pa_eq")),
+    ]
+)
+
+
+def keep_count(n: int, ratio: float) -> int:
+    """Tokens kept at budget `ratio`: Python round(), as in FastV's code, clipped to [1, n]."""
+    return max(1, min(n, int(round(ratio * n))))
+
+
+def rng_for(seed: int, qid: str) -> np.random.Generator:
+    """Per-question generator that is identical across processes (Python's str hash() is salted)."""
+    digest = hashlib.sha256(f"{seed}:{qid}".encode()).digest()
+    return np.random.default_rng(int.from_bytes(digest[:8], "little"))
+
+
+def _even_pick(candidates: np.ndarray, k: int) -> np.ndarray:
+    """k evenly spaced members of a sorted candidate array (first one always included)."""
+    if k <= 0 or candidates.size == 0:
+        return candidates[:0]
+    if k >= candidates.size:
+        return candidates.copy()
+    pos = np.floor(np.linspace(0, candidates.size - 1, k) + 0.5).astype(int)
+    return candidates[np.unique(pos)]
+
+
+def _finish(chosen: np.ndarray, n: int, k: int, fallback_order: np.ndarray) -> np.ndarray:
+    """Top up `chosen` to k entries following `fallback_order`, then sort."""
+    chosen = np.unique(chosen)
+    if chosen.size < k:
+        rest = fallback_order[~np.isin(fallback_order, chosen)]
+        chosen = np.concatenate([chosen, rest[: k - chosen.size]])
+    return np.sort(chosen[:k]).astype(np.int64)
+
+
+def select_random(n: int, k: int, rng: np.random.Generator, allowed: np.ndarray | None = None) -> np.ndarray:
+    """k tokens uniformly at random, among `allowed` tokens when given (topped up at random from the rest)."""
+    if allowed is None:
+        return np.sort(rng.choice(n, size=k, replace=False)).astype(np.int64)
+    inside = np.flatnonzero(allowed)
+    chosen = rng.choice(inside, size=min(k, inside.size), replace=False)
+    outside = np.setdiff1d(np.arange(n), chosen)
+    return _finish(chosen, n, k, rng.permutation(outside))
+
+
+def select_uniform(n: int, k: int, allowed: np.ndarray | None = None) -> np.ndarray:
+    """Evenly spaced in raster order, among `allowed` tokens when given."""
+    everything = np.arange(n)
+    candidates = everything if allowed is None else np.flatnonzero(allowed)
+    chosen = _even_pick(candidates, k)
+    outside = np.setdiff1d(everything, chosen)
+    return _finish(chosen, n, k, _even_pick(outside, k - chosen.size) if chosen.size < k else outside)
+
+
+def select_uniform_quota(n: int, k: int, allowed: np.ndarray, k_bg: int) -> np.ndarray:
+    """k_bg evenly spaced tokens outside `allowed` (fewer if the background is smaller), the rest evenly spaced inside."""
+    allowed = np.asarray(allowed, dtype=bool)
+    background = _even_pick(np.flatnonzero(~allowed), min(k_bg, k))
+    chosen = np.union1d(background, _even_pick(np.flatnonzero(allowed), k - background.size))
+    outside = np.setdiff1d(np.arange(n), chosen)
+    return _finish(chosen, n, k, _even_pick(outside, k - chosen.size) if chosen.size < k else outside)
+
+
+def select_topk(scores: np.ndarray, k: int, allowed: np.ndarray | None = None) -> np.ndarray:
+    """Highest scores, among `allowed` tokens when given (ties broken by position)."""
+    order = np.argsort(-np.asarray(scores, dtype=np.float64), kind="stable")
+    if allowed is None:
+        return np.sort(order[:k]).astype(np.int64)
+    inside = order[np.asarray(allowed, dtype=bool)[order]]
+    return _finish(inside[:k], len(order), k, order)
+
+
+def select_inverse(allowed: np.ndarray, k: int) -> np.ndarray:
+    """Background-only control: k evenly spaced tokens among the tokens the gate rejects."""
+    background = np.flatnonzero(~np.asarray(allowed, dtype=bool))
+    chosen = _even_pick(background, k)
+    foreground = np.flatnonzero(np.asarray(allowed, dtype=bool))
+    return _finish(chosen, len(allowed), k, _even_pick(foreground, max(k - chosen.size, 0)))
+
+
+def select_divprune(feats: np.ndarray, k: int, allowed: np.ndarray | None = None) -> np.ndarray:
+    """DivPrune (Alvar et al., CVPR 2025, Alg. 1): greedy max-min cosine diversity.
+
+    First pick: the token whose nearest neighbour is farthest. Then repeatedly add the candidate whose minimum
+    distance to the selected set is largest.
+    """
+    x = np.asarray(feats, dtype=np.float64)
+    x = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
+    dist = 1.0 - x @ x.T
+    n = len(x)
+    candidates = np.ones(n, dtype=bool) if allowed is None else np.asarray(allowed, dtype=bool).copy()
+    if candidates.sum() < k:  # restriction too tight: allow everything, keeping restricted tokens first
+        first = np.flatnonzero(candidates)
+        rest = select_divprune(feats, k, None)
+        return _finish(first, n, k, rest)
+    chosen: list[int] = []
+    for i in range(k):
+        if i == 0:
+            nn = np.sort(dist, axis=0)[1] if n > 1 else np.zeros(1)  # distance to nearest other token
+            score = nn
+        else:
+            score = dist[chosen].min(axis=0)
+        score = np.where(candidates, score, -np.inf)
+        score[chosen] = -np.inf
+        chosen.append(int(np.argmax(score)))
+    return np.sort(np.array(chosen, dtype=np.int64))
+
+
+def sample_map(static_map: np.ndarray, grid_hw: tuple[int, int]) -> np.ndarray:
+    """Bilinear sample of a normalized map (R x R over [0,1]^2) at the centres of an H x W token grid."""
+    r_res, c_res = static_map.shape
+    h, w = grid_hw
+    rows = ((np.arange(h) + 0.5) / h) * r_res - 0.5
+    cols = ((np.arange(w) + 0.5) / w) * c_res - 0.5
+    rr, cc = np.meshgrid(np.clip(rows, 0, r_res - 1), np.clip(cols, 0, c_res - 1), indexing="ij")
+    r0, c0 = np.floor(rr).astype(int), np.floor(cc).astype(int)
+    r1, c1 = np.minimum(r0 + 1, r_res - 1), np.minimum(c0 + 1, c_res - 1)
+    fr, fc = rr - r0, cc - c0
+    top = static_map[r0, c0] * (1 - fc) + static_map[r0, c1] * fc
+    bottom = static_map[r1, c0] * (1 - fc) + static_map[r1, c1] * fc
+    return (top * (1 - fr) + bottom * fr).reshape(-1)
+
+
+def select_static(static_map: np.ndarray, grid_hw: tuple[int, int], k: int,
+                  allowed: np.ndarray | None = None) -> np.ndarray:
+    """Position-only control: rank tokens by a fixed map learned on another dataset."""
+    return select_topk(sample_map(static_map, grid_hw), k, allowed)
+
+
+def pdrop_schedule(rho: float, n_layers: int, first: int = 2) -> list[tuple[int, float]]:
+    """PDrop stages token-matched to FastV at budget rho (plan.md §C3).
+
+    Four stages start at `first` and every ceil((L - first) / 4) layers; keep fractions a, a/2, a/4, a/8 of N with a
+    chosen so the mean number of visual tokens per layer equals FastV's (first + (L - first) * rho) / L.
+    Returns [(boundary_layer, keep_fraction), ...].
+    """
+    step = math.ceil((n_layers - first) / 4)
+    bounds = [first + i * step for i in range(4)]
+    spans = [bounds[1] - bounds[0], bounds[2] - bounds[1], bounds[3] - bounds[2], n_layers - bounds[3]]
+    weight = spans[0] + spans[1] / 2 + spans[2] / 4 + spans[3] / 8
+    a = (n_layers - first) * rho / weight
+    return [(b, min(1.0, a / 2**i)) for i, b in enumerate(bounds)]
